@@ -1,5 +1,5 @@
 import streamlit as st
-import yfinance as yf
+import requests
 import pandas as pd
 import numpy as np
 from scipy.stats import norm
@@ -8,91 +8,95 @@ import plotly.graph_objects as go
 
 st.set_page_config(page_title="GEX Butterfly Scanner", layout="wide")
 
-# --- Black-Scholes Gamma Calculation ---
+# --- Fallback Black-Scholes Gamma (if Cboe gamma field is 0/missing) ---
 def calculate_bs_gamma(S, K, T, r, sigma):
-    """Computes Black-Scholes Gamma for a given strike."""
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return 0.0
     d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-    gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
-    return gamma
+    return norm.pdf(d1) / (S * sigma * np.sqrt(T))
 
 @st.cache_data(ttl=300)
-def fetch_ticker_data(ticker_symbol):
-    """Fetches spot price and available option expiration dates."""
-    tk = yf.Ticker(ticker_symbol)
-    hist = tk.history(period="5d")
-    if hist.empty:
-        return None, []
-    spot = float(hist["Close"].iloc[-1])
-    expirations = list(tk.options)
-    return spot, expirations
+def fetch_cboe_chain(ticker_symbol):
+    """Fetches full option chain + spot price from Cboe's free delayed JSON endpoint."""
+    clean_ticker = ticker_symbol.upper().strip()
+    # Cboe prefixes index tickers like SPX, NDX, RUT with an underscore
+    index_tickers = {"SPX", "NDX", "RUT", "VIX", "XSP"}
+    cboe_symbol = f"_{clean_ticker}" if clean_ticker in index_tickers else clean_ticker
 
-@st.cache_data(ttl=300)
-def compute_gex_profile(ticker_symbol, spot, selected_expirations, risk_free_rate=0.045):
-    """Calculates strike-by-strike Call GEX, Put GEX, and Net GEX ($ Millions)."""
-    tk = yf.Ticker(ticker_symbol)
+    url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{cboe_symbol}.json"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
+    }
+
+    resp = requests.get(url, headers=headers, timeout=15)
+    if resp.status_code != 200:
+        return None, pd.DataFrame(), f"HTTP {resp.status_code}"
+
+    payload = resp.json()
+    data = payload.get("data", {})
+    spot = data.get("current_price") or data.get("close") or data.get("last_trade_price")
+    options = data.get("options", [])
+
+    if not spot or not options:
+        return None, pd.DataFrame(), "Empty option chain returned by Cboe"
+
+    spot = float(spot)
     now = datetime.now()
-    records = []
+    parsed = []
 
-    for exp_str in selected_expirations:
-        try:
-            chain = tk.option_chain(exp_str)
-            exp_dt = datetime.strptime(exp_str, "%Y-%m-%d")
-            # Calculate time to expiration in years (minimum 0.5 trading days to avoid div-by-zero on 0DTE)
-            days_to_exp = max((exp_dt - now).days + 0.5, 0.5)
-            T = days_to_exp / 365.0
-
-            calls = chain.calls.copy()
-            puts = chain.puts.copy()
-
-            # Compute Gamma for Calls
-            for _, row in calls.iterrows():
-                oi = row.get("openInterest", 0)
-                iv = row.get("impliedVolatility", 0)
-                strike = row.get("strike", 0)
-                if pd.notna(oi) and oi > 0 and pd.notna(iv) and iv > 0:
-                    gamma = calculate_bs_gamma(spot, strike, T, risk_free_rate, iv)
-                    # Standard GEX: Calls are positive dealer gamma (+100 shares * Spot^2 * 0.01)
-                    call_gex = gamma * oi * 100 * (spot ** 2) * 0.01
-                    records.append({"strike": strike, "call_gex": call_gex, "put_gex": 0.0})
-
-            # Compute Gamma for Puts
-            for _, row in puts.iterrows():
-                oi = row.get("openInterest", 0)
-                iv = row.get("impliedVolatility", 0)
-                strike = row.get("strike", 0)
-                if pd.notna(oi) and oi > 0 and pd.notna(iv) and iv > 0:
-                    gamma = calculate_bs_gamma(spot, strike, T, risk_free_rate, iv)
-                    # Standard GEX: Puts are negative dealer gamma (-100 shares * Spot^2 * 0.01)
-                    put_gex = -gamma * oi * 100 * (spot ** 2) * 0.01
-                    records.append({"strike": strike, "call_gex": 0.0, "put_gex": put_gex})
-
-        except Exception:
+    for opt in options:
+        # Cboe option symbol format: e.g., SPY261218C00600000
+        sym = opt.get("option", "")
+        if len(sym) < 15:
             continue
 
-    if not records:
-        return pd.DataFrame()
+        # Extract YYMMDD, C/P, and Strike from right side of OCC symbol
+        strike_raw = sym[-8:]
+        opt_type = sym[-9]
+        exp_raw = sym[-15:-9]
 
-    df = pd.DataFrame(records)
-    grouped = df.groupby("strike", as_index=False).sum()
-    grouped["net_gex"] = grouped["call_gex"] + grouped["put_gex"]
-    # Convert to Millions for clean readability
-    grouped["call_gex_m"] = grouped["call_gex"] / 1e6
-    grouped["put_gex_m"] = grouped["put_gex"] / 1e6
-    grouped["net_gex_m"] = grouped["net_gex"] / 1e6
-    return grouped.sort_values("strike").reset_index(drop=True)
+        try:
+            strike = int(strike_raw) / 1000.0
+            exp_dt = datetime.strptime(exp_raw, "%y%m%d")
+            exp_str = exp_dt.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+
+        oi = float(opt.get("open_interest") or 0)
+        iv = float(opt.get("iv") or 0)
+        gamma = float(opt.get("gamma") or 0)
+
+        if oi <= 0:
+            continue
+
+        if gamma <= 0 and iv > 0:
+            days_to_exp = max((exp_dt - now).days + 0.5, 0.5)
+            gamma = calculate_bs_gamma(spot, strike, days_to_exp / 365.0, 0.045, iv)
+
+        if gamma <= 0:
+            continue
+
+        gex_val = gamma * oi * 100 * (spot ** 2) * 0.01
+        if opt_type == "C":
+            parsed.append({"expiration": exp_str, "strike": strike, "call_gex": gex_val, "put_gex": 0.0})
+        elif opt_type == "P":
+            parsed.append({"expiration": exp_str, "strike": strike, "call_gex": 0.0, "put_gex": -gex_val})
+
+    if not parsed:
+        return spot, pd.DataFrame(), "No active open interest contracts found"
+
+    df = pd.DataFrame(parsed)
+    return spot, df, None
 
 def find_zero_gamma(df, spot):
     """Finds the Zero Gamma flip strike closest to current spot price."""
     if df.empty or len(df) < 2:
         return 0.0
-    # Filter to strikes within +/- 15% of spot to ignore deep OTM noise
     near = df[(df["strike"] >= spot * 0.85) & (df["strike"] <= spot * 1.15)].copy()
     if len(near) < 2:
         near = df.copy()
 
-    # Compute cumulative GEX curve from lowest strike up to find the sign flip
     near["cum_gex"] = near["net_gex"].cumsum()
     flips = []
     for i in range(1, len(near)):
@@ -101,16 +105,12 @@ def find_zero_gamma(df, spot):
         if (prev_val < 0 and curr_val >= 0) or (prev_val > 0 and curr_val <= 0):
             s1 = near.iloc[i - 1]["strike"]
             s2 = near.iloc[i]["strike"]
-            # Linear interpolation between the two bracketing strikes
             weight = abs(prev_val) / (abs(prev_val) + abs(curr_val))
-            flip_strike = s1 + weight * (s2 - s1)
-            flips.append(flip_strike)
+            flips.append(s1 + weight * (s2 - s1))
 
     if flips:
-        # Return flip closest to spot
         return round(min(flips, key=lambda x: abs(x - spot)), 2)
 
-    # Fallback: strike with minimum absolute net GEX near spot
     idx_min = near["net_gex"].abs().idxmin()
     return round(float(near.loc[idx_min, "strike"]), 2)
 
@@ -119,15 +119,18 @@ st.title("GEX Butterfly & ThinkScript Level Scanner")
 
 col_in1, col_in2, col_in3 = st.columns([1, 1.5, 1])
 with col_in1:
-    ticker = st.text_input("Ticker Symbol", value="SPY").upper().strip()
+    ticker = st.text_input("Ticker Symbol (e.g. SPY, QQQ, SPX, AAPL)", value="SPY").upper().strip()
 with col_in3:
     range_pct = st.slider("Strike Range (+/- % from Spot)", min_value=3, max_value=20, value=8)
 
-spot, expirations = fetch_ticker_data(ticker)
+with st.spinner(f"Fetching Cboe option chain for {ticker}..."):
+    spot, raw_df, err_msg = fetch_cboe_chain(ticker)
 
-if not spot or not expirations:
-    st.error(f"Could not retrieve option chain data for '{ticker}'. Check the ticker symbol and try again.")
+if err_msg or raw_df.empty:
+    st.error(f"Could not retrieve option chain data for '{ticker}' ({err_msg}). Check the ticker symbol and try again.")
     st.stop()
+
+expirations = sorted(raw_df["expiration"].unique().tolist())
 
 with col_in2:
     mode = st.radio(
@@ -147,12 +150,12 @@ else:
     target_exps = expirations
     exp_label = "ALL EXPIRATIONS"
 
-with st.spinner(f"Calculating GEX profile for {ticker}..."):
-    gex_df = compute_gex_profile(ticker, spot, target_exps)
-
-if gex_df.empty:
-    st.warning("No valid open interest / implied volatility data returned for the selected expiration(s).")
-    st.stop()
+filtered_df = raw_df[raw_df["expiration"].isin(target_exps)]
+gex_df = filtered_df.groupby("strike", as_index=False)[["call_gex", "put_gex"]].sum()
+gex_df["net_gex"] = gex_df["call_gex"] + gex_df["put_gex"]
+gex_df["call_gex_m"] = gex_df["call_gex"] / 1e6
+gex_df["put_gex_m"] = gex_df["put_gex"] / 1e6
+gex_df = gex_df.sort_values("strike").reset_index(drop=True)
 
 # Filter display & wall detection around spot
 lower_bound = spot * (1 - range_pct / 100.0)
@@ -166,12 +169,10 @@ if window_df.empty:
 zero_gamma = find_zero_gamma(gex_df, spot)
 net_gex_billions = round(gex_df["net_gex"].sum() / 1e9, 2)
 
-# Top 2 Call Walls (highest positive Call GEX)
 top_calls = window_df.sort_values("call_gex", ascending=False)
 major_call_wall = float(top_calls.iloc[0]["strike"]) if len(top_calls) > 0 else 0.0
 sec_call_wall = float(top_calls.iloc[1]["strike"]) if len(top_calls) > 1 else 0.0
 
-# Top 2 Put Walls (most negative Put GEX)
 top_puts = window_df.sort_values("put_gex", ascending=True)
 major_put_wall = float(top_puts.iloc[0]["strike"]) if len(top_puts) > 0 else 0.0
 sec_put_wall = float(top_puts.iloc[1]["strike"]) if len(top_puts) > 1 else 0.0
